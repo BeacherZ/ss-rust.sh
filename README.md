@@ -1,5 +1,7 @@
 # Shadowsocks-Rust 服务管理脚本
 
+<p align="center"><a href="README_EN.md">English</a> ｜ 简体中文</p>
+
 一个轻量、全自动化且高度兼容的 **Shadowsocks-Rust** 服务端管理脚本。
 
 专门针对多种主流 Linux 发行版与各类老旧客户端，进行了全方位的深度适配与无缝兼容优化。
