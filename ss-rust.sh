@@ -22,16 +22,19 @@ TMP_DIR=""
 # 各 minor 分支终态修正版（Patch Release）+ 最新分支的预设兜底列表
 FALLBACK_LIST="v1.23.4 v1.22.0 v1.21.2 v1.20.4 v1.19.4 v1.18.4"
 
-# 全局中断与清理机制：保证 Ctrl+C 触发时瞬间摧毁临时文件并立刻退出整个脚本
+# 全局中断与清理机制：Ctrl+C / TERM 触发时静默清理临时文件后立即退出（不打印任何提示）
+# 注意：临时目录里可能堆积着多个已下载的软件包，必须无条件清理，不能因为静默而省略
 cleanup_on_exit() {
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
         rm -rf "$TMP_DIR"
     fi
+    TMP_DIR=""
 }
 
 cleanup_on_interrupt() {
-    echo -e "\n\033[31m[INFO] 接收到中断信号 (Ctrl+C)，正在清理临时文件并彻底退出...\033[0m"
     cleanup_on_exit
+    trap - INT TERM EXIT
+    echo ""    # 仅换行，不打印任何提示文字，避免 shell 提示符黏在 ^C 后面
     exit 130
 }
 
@@ -143,6 +146,36 @@ is_newer_version() {
     [[ "$highest" == "$new_ver" ]] && return 0 || return 1
 }
 
+# AEAD-2022 (SIP022) 的 password 必须是 base64 编码、且解码后长度等于该方法的 key 长度，
+# 普通 ASCII 口令会让 ssserver 启动即失败，因此单独识别与生成
+method_key_len() {
+    case "$1" in
+        2022-blake3-aes-128-gcm) echo 16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) echo 32 ;;
+        *) echo 0 ;;
+    esac
+}
+
+# 生成指定字节数的 base64 随机密钥（不依赖 openssl，BusyBox 环境同样可用）
+rand_psk() {
+    head -c "$1" /dev/urandom | base64 | tr -d '\n'
+}
+
+# 校验口令是否已是合法 base64 且解码长度符合要求
+is_valid_psk() {
+    local got
+    got=$(printf '%s' "$1" | base64 -d 2>/dev/null | wc -c | tr -d '[:space:]')
+    [[ -n "$got" && "$got" -eq "$2" ]]
+}
+
+# JSON 字符串转义（无 jq 时的兜底，避免密码含引号/反斜杠写出非法配置）
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
 get_supported_methods() {
     local target_bin="${1:-$BIN_PATH}"
     local raw_methods
@@ -217,18 +250,19 @@ fetch_version_list() {
     fi
 }
 
-# 核心下载核验函数（带 -fL 容错：解压即删压缩包 / 校验不符合即删二进制）
+# 核心下载核验函数（带 -fL 容错：sha256 校验 + 解压即删压缩包 / 校验不符合即删二进制）
 download_and_verify() {
     local target_ver="$1"
     local ss_arch="$2"
     local tmp_dir="$3"
 
-    local pkg_file="${tmp_dir}/ss-rust.tar.xz"
+    local fname="shadowsocks-${target_ver}.${ss_arch}.tar.xz"
+    local pkg_file="${tmp_dir}/${fname}"
     local bin_file="${tmp_dir}/ssserver"
 
-    rm -f "$pkg_file" "$bin_file"
+    rm -f "$pkg_file" "${pkg_file}.sha256" "$bin_file"
 
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${target_ver}/shadowsocks-${target_ver}.${ss_arch}.tar.xz"
+    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${target_ver}/${fname}"
     
     curl -fL -s --connect-timeout 10 --max-time 60 \
         -H "User-Agent: Shadowsocks-Rust-Updater/1.0" \
@@ -239,6 +273,22 @@ download_and_verify() {
         rm -f "$pkg_file"
         return 1
     fi
+
+    # 官方 release 每个 asset 都附带 .sha256 旁文件，校验通过后才允许解包
+    if command -v sha256sum >/dev/null 2>&1; then
+        if curl -fsL -s --max-time 20 -o "${pkg_file}.sha256" "${url}.sha256" && [[ -s "${pkg_file}.sha256" ]]; then
+            if ! ( cd "$tmp_dir" && sha256sum -c "${fname}.sha256" >/dev/null 2>&1 ); then
+                echo -e " │  └─ \033[31m[FAIL] sha256 校验不通过，丢弃该包并跳过...\033[0m"
+                rm -f "$pkg_file" "${pkg_file}.sha256"
+                return 1
+            fi
+        else
+            echo -e " │  └─ \033[33m[WARN] 未取到 sha256 校验文件，跳过完整性校验\033[0m"
+        fi
+    else
+        echo -e " │  └─ \033[33m[WARN] 系统缺少 sha256sum，跳过完整性校验\033[0m"
+    fi
+    rm -f "${pkg_file}.sha256"
 
     tar -xf "$pkg_file" -C "$tmp_dir" ssserver 2>/dev/null
     rm -f "$pkg_file"
@@ -264,6 +314,19 @@ install_ss() {
     echo "         安装 Shadowsocks-Rust 服务端"
     echo -e "══════════════════════════════════════════════════════════════"
     
+    # 覆盖安装保护：旧配置里有正在使用的端口/密码，静默覆盖会让已发出的客户端全部失效
+    if [[ -f "$CONF_FILE" ]]; then
+        echo -e "\033[33m[WARN] 检测到已有配置: $CONF_FILE\033[0m"
+        echo -e "\033[33m       继续安装会重新生成端口/密码，现有客户端将全部失效。\033[0m"
+        read -p "  是否继续覆盖安装? [y/N]: " OVERWRITE_CONFIRM
+        if [[ ! "$OVERWRITE_CONFIRM" =~ ^[Yy]$ ]]; then
+            echo "  已取消安装，现有配置未改动。"
+            return
+        fi
+        CONF_BAK="${CONF_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$CONF_FILE" "$CONF_BAK" && echo -e "\033[32m[INFO] 原配置已备份: $CONF_BAK\033[0m"
+    fi
+
     install_dependencies
 
     echo "[STEP] 正在自动检索系统架构..."
@@ -322,12 +385,24 @@ install_ss() {
     echo "  交互设置 (准备配置 Shadowsocks-Rust $FOUND_VER)"
     echo "──────────────────────────────────────────────────────────────"
     
-    read -p "  输入服务端口 [1-65535] (默认: 56688): " PORT
-    PORT=${PORT:-56688}
+    while :; do
+        read -rp "  输入服务端口 [1-65535] (默认: 56688): " PORT
+        PORT=${PORT:-56688}
+        if [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )); then
+            PORT=$((10#$PORT))
+            break
+        fi
+        echo -e "  \033[31m端口非法，请输入 1-65535 之间的数字。\033[0m"
+    done
 
     RAND_PASS=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
-    read -p "  输入连接密码 (默认随机生成): " PASSWORD
-    PASSWORD=${PASSWORD:-$RAND_PASS}
+    read -rp "  输入连接密码 (默认随机生成): " PASSWORD
+    if [[ -z "$PASSWORD" ]]; then
+        PASSWORD="$RAND_PASS"
+        PW_IS_RANDOM=1
+    else
+        PW_IS_RANDOM=0
+    fi
 
     TMP_BIN="${TMP_DIR}/ssserver"
     METHODS=($(get_supported_methods "$TMP_BIN"))
@@ -346,10 +421,22 @@ install_ss() {
     read -p "  请选择 [1-${#METHODS[@]}] (默认: 1): " METHOD_CHOICE
     METHOD_CHOICE=${METHOD_CHOICE:-1}
 
-    if [[ "$METHOD_CHOICE" -ge 1 && "$METHOD_CHOICE" -le "${#METHODS[@]}" ]]; then
+    if [[ "$METHOD_CHOICE" =~ ^[0-9]+$ ]] && (( METHOD_CHOICE >= 1 && METHOD_CHOICE <= ${#METHODS[@]} )); then
         METHOD="${METHODS[$((METHOD_CHOICE-1))]}"
     else
         METHOD="aes-128-gcm"
+    fi
+
+    # AEAD-2022 的 password 必须是 base64、且解码长度等于 key 长度，否则 ssserver 启动即失败
+    METHOD_KEY_LEN=$(method_key_len "$METHOD")
+    if (( METHOD_KEY_LEN > 0 )); then
+        if [[ "${PW_IS_RANDOM:-0}" -eq 1 ]]; then
+            PASSWORD=$(rand_psk "$METHOD_KEY_LEN")
+            echo -e "  \033[33m[INFO] $METHOD 使用 ${METHOD_KEY_LEN} 字节 base64 随机密钥作为密码。\033[0m"
+        elif ! is_valid_psk "$PASSWORD" "$METHOD_KEY_LEN"; then
+            PASSWORD=$(rand_psk "$METHOD_KEY_LEN")
+            echo -e "  \033[33m[WARN] $METHOD 要求 ${METHOD_KEY_LEN} 字节的 base64 密钥，已用随机密钥替换你输入的口令。\033[0m"
+        fi
     fi
 
     echo -e "\n  选择传输模式:"
@@ -363,25 +450,44 @@ install_ss() {
         *) MODE="tcp_and_udp" ;;
     esac
 
-    echo "[STEP] 部署二进制文件与生成配置文件..."
-    mv "${TMP_DIR}/ssserver" "$BIN_PATH"
-    chmod +x "$BIN_PATH"
-
-    cleanup_on_exit
-    TMP_DIR=""
-
+    echo "[STEP] 生成配置文件..."
     mkdir -p "$CONF_DIR"
-    cat <<EOF > "$CONF_FILE"
+    # 用 jq 生成 JSON，避免密码含引号/反斜杠时写出非法配置；无 jq 时退回手工转义
+    if command -v jq >/dev/null 2>&1; then
+        if ! jq -n --argjson port "$PORT" --arg pw "$PASSWORD" --arg method "$METHOD" --arg mode "$MODE" \
+            '{server: "::", server_port: $port, password: $pw, method: $method, mode: $mode, fast_open: false}' \
+            > "${CONF_FILE}.tmp"; then
+            echo -e "\033[31m[ERROR] 配置生成失败，安装已中止（现有安装未被改动）。\033[0m"
+            rm -f "${CONF_FILE}.tmp"
+            return
+        fi
+    else
+        cat <<EOF > "${CONF_FILE}.tmp"
 {
     "server": "::",
     "server_port": $PORT,
-    "password": "$PASSWORD",
-    "method": "$METHOD",
-    "mode": "$MODE",
+    "password": "$(json_escape "$PASSWORD")",
+    "method": "$(json_escape "$METHOD")",
+    "mode": "$(json_escape "$MODE")",
     "fast_open": false
 }
 EOF
+    fi
+
+    echo "[STEP] 部署二进制文件..."
+    if ! mv "${TMP_DIR}/ssserver" "$BIN_PATH"; then
+        echo -e "\033[31m[ERROR] 二进制部署失败（可能正在被占用或磁盘已满），安装已中止。\033[0m"
+        rm -f "${CONF_FILE}.tmp"
+        cleanup_on_exit
+        return
+    fi
+    chmod +x "$BIN_PATH"
+
+    mv -f "${CONF_FILE}.tmp" "$CONF_FILE"
     chmod 600 "$CONF_FILE"
+
+    cleanup_on_exit
+    TMP_DIR=""
 
     # 自动放行端口
     open_port "$PORT"
