@@ -36,7 +36,7 @@
 使用 `root` 权限登录服务器后，直接复制并执行以下命令：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/BeacherZ/Shadowsocks-Rust/main/ss-rust.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/BeacherZ/ss-rust.sh/main/ss-rust.sh)
 
 ```
 
