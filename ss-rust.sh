@@ -20,7 +20,12 @@ BIN_PATH="/usr/local/bin/ssserver"
 TMP_DIR=""
 
 # 各 minor 分支终态修正版（Patch Release）+ 最新分支的预设兜底列表
-FALLBACK_LIST="v1.23.4 v1.22.0 v1.21.2 v1.20.4 v1.19.4 v1.18.4"
+# 兜底列表必须从上游当前最新 Tag 开始，否则 API 受限时会跳过新版直接降级
+FALLBACK_LIST="v1.25.0 v1.24.0 v1.23.5 v1.23.4 v1.22.0 v1.21.2 v1.20.4 v1.19.4 v1.18.4"
+
+# 个人偏好的加密方式：版本轮询时按「完整方法名精确比对」判定，不做子串包含匹配
+# 否则 2022-blake3-aes-128-gcm 也会被当成 aes-128-gcm
+PREFERRED_METHOD="aes-128-gcm"
 
 # 全局中断与清理机制：Ctrl+C / TERM 触发时静默清理临时文件后立即退出（不打印任何提示）
 # 注意：临时目录里可能堆积着多个已下载的软件包，必须无条件清理，不能因为静默而省略
@@ -42,6 +47,11 @@ cleanup_on_interrupt() {
 trap cleanup_on_interrupt INT TERM
 trap cleanup_on_exit EXIT
 
+# 判断当前 PID 1 是否为 systemd：仅凭 systemctl 存在会被容器/自编译环境误导
+has_systemd() {
+    [[ -d /run/systemd/system ]]
+}
+
 # 自动检测并放行系统本地防火墙端口
 open_port() {
     local port=$1
@@ -55,7 +65,7 @@ open_port() {
     fi
 
     # 2. 检测并放行 Firewalld (CentOS / RHEL / Fedora)
-    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
         firewall-cmd --zone=public --add-port="$port"/tcp --permanent >/dev/null 2>&1
         firewall-cmd --zone=public --add-port="$port"/udp --permanent >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
@@ -69,6 +79,44 @@ open_port() {
         if command -v ip6tables >/dev/null 2>&1; then
             ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
             ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null
+        fi
+    fi
+}
+
+# 卸载时回收 open_port 写入的端口规则（删除不存在的规则只会报错，无需额外判断）
+close_port() {
+    local port=$1
+    echo "[STEP] 正在回收防火墙端口 $port 的放行规则 ..."
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow "$port"/tcp >/dev/null 2>&1
+        ufw delete allow "$port"/udp >/dev/null 2>&1
+        echo -e "\033[32m[SUCCESS] 已移除 UFW 中端口 $port 的放行规则\033[0m"
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+        firewall-cmd --zone=public --remove-port="$port"/tcp --permanent >/dev/null 2>&1
+        firewall-cmd --zone=public --remove-port="$port"/udp --permanent >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        echo -e "\033[32m[SUCCESS] 已移除 Firewalld 中端口 $port 的放行规则\033[0m"
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        # -D 每次只删一条同规则，循环删净（上限 5 次，避免死循环）
+        local i
+        for i in 1 2 3 4 5; do
+            iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+        done
+        for i in 1 2 3 4 5; do
+            iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || break
+        done
+        if command -v ip6tables >/dev/null 2>&1; then
+            for i in 1 2 3 4 5; do
+                ip6tables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+            done
+            for i in 1 2 3 4 5; do
+                ip6tables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || break
+            done
         fi
     fi
 }
@@ -96,7 +144,7 @@ install_dependencies() {
 
 # 判断服务是否在运行
 is_service_running() {
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet shadowsocks-rust 2>/dev/null; then
+    if has_systemd && systemctl is-active --quiet shadowsocks-rust 2>/dev/null; then
         return 0
     elif command -v rc-service >/dev/null 2>&1 && rc-service shadowsocks-rust status 2>/dev/null | grep -q "started"; then
         return 0
@@ -107,7 +155,7 @@ is_service_running() {
 }
 
 start_service_cmd() {
-    if command -v systemctl >/dev/null 2>&1; then
+    if has_systemd; then
         systemctl start shadowsocks-rust
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service shadowsocks-rust start
@@ -117,7 +165,7 @@ start_service_cmd() {
 }
 
 stop_service_cmd() {
-    if command -v systemctl >/dev/null 2>&1; then
+    if has_systemd; then
         systemctl stop shadowsocks-rust
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service shadowsocks-rust stop
@@ -186,15 +234,40 @@ get_supported_methods() {
     fi
 
     local method_list=()
-    method_list+=("aes-128-gcm")
+    method_list+=("$PREFERRED_METHOD")
 
     for m in $raw_methods; do
         m=$(echo "$m" | xargs)
-        [[ -z "$m" || "$m" == "none" || "$m" == "plain" || "$m" == "aes-128-gcm" ]] && continue
+        [[ -z "$m" || "$m" == "none" || "$m" == "plain" || "$m" == "$PREFERRED_METHOD" ]] && continue
         method_list+=("$m")
     done
 
     echo "${method_list[@]}"
+}
+
+# 精确判断指定二进制是否支持某个加密方式：必须与方法表里的完整名字完全相等
+# 不能用 grep 子串匹配 —— "2022-blake3-aes-128-gcm" 里同样含有 "aes-128-gcm"
+supports_method() {
+    local target_bin="$1"
+    local want="$2"
+    local raw_methods m
+
+    raw_methods=$("$target_bin" --help 2>&1 | tr '\n' ' ' | grep -oiE "possible values: [^]]+" | sed 's/[Pp]ossible values: //; s/,/ /g')
+
+    if [[ -z "$raw_methods" ]]; then
+        # 方法表解析不出来（上游 help 文案变动）时退回词边界匹配：
+        # 前后必须是分隔符，避免把 xxx-aes-128-gcm 之类误判为 aes-128-gcm
+        "$target_bin" --help 2>&1 | tr '\n' ' ' \
+            | grep -qE "(^|[^[:alnum:]_-])${want//./\\.}([^[:alnum:]_-]|$)"
+        return
+    fi
+
+    for m in $raw_methods; do
+        m=$(echo "$m" | xargs)
+        [[ "$m" == "$want" ]] && return 0
+    done
+
+    return 1
 }
 
 print_status_line() {
@@ -227,7 +300,7 @@ fetch_version_list() {
         -H "User-Agent: Shadowsocks-Rust-Updater/1.0" \
         -H "Accept: application/vnd.github.v3+json" \
         "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases?per_page=30" \
-        | jq -r '.[].tag_name' 2>/dev/null | grep -E '^v[0-9]+' | grep -v 'null')
+        | jq -r '.[] | select(.prerelease == false) | .tag_name' 2>/dev/null | grep -E '^v[0-9]+' | grep -v 'null')
 
     if [[ -n "$api_releases" ]]; then
         echo "API_SUCCESS"
@@ -295,10 +368,10 @@ download_and_verify() {
 
     if [[ -f "$bin_file" ]]; then
         chmod +x "$bin_file"
-        if "$bin_file" --help 2>&1 | grep -qi "aes-128-gcm"; then
+        if supports_method "$bin_file" "$PREFERRED_METHOD"; then
             return 0
         else
-            echo -e " │  └─ \033[33m[UNSUPPORTED] 版本 $target_ver 不支持 aes-128-gcm，清理文件并测试下一版本...\033[0m"
+            echo -e " │  └─ \033[33m[UNSUPPORTED] 版本 $target_ver 的方法表中没有 $PREFERRED_METHOD，清理文件并测试下一版本...\033[0m"
             rm -f "$bin_file"
             return 1
         fi
@@ -335,7 +408,10 @@ install_ss() {
         x86_64|amd64)   SS_ARCH="x86_64-unknown-linux-musl" ;;
         aarch64|arm64)  SS_ARCH="aarch64-unknown-linux-musl" ;;
         armv7l|armhf)   SS_ARCH="armv7-unknown-linux-musleabihf" ;;
+        armv6l)         SS_ARCH="arm-unknown-linux-musleabihf" ;;
         i386|i686)      SS_ARCH="i686-unknown-linux-musl" ;;
+        loongarch64)    SS_ARCH="loongarch64-unknown-linux-musl" ;;
+        riscv64)        SS_ARCH="riscv64gc-unknown-linux-musl" ;;
         *) echo -e "\033[31m[ERROR] 暂不支持的架构: $ARCH\033[0m"; return ;;
     esac
     echo "[INFO] 检测到架构: $ARCH (优先采用 Musl 静态编译包)"
@@ -364,18 +440,18 @@ install_ss() {
     TMP_DIR=$(mktemp -d -p /var/tmp 2>/dev/null || mktemp -d)
     FOUND_VER=""
 
-    echo "[STEP] 开始逐个下载并严格核验是否支持 aes-128-gcm..."
+    echo "[STEP] 从最新版本开始逐个下载，并精确核验方法表中是否含 $PREFERRED_METHOD..."
     for VER in $ALL_RELEASES; do
         echo " ├─ 正在核验版本: $VER ..."
         if download_and_verify "$VER" "$SS_ARCH" "$TMP_DIR"; then
             FOUND_VER="$VER"
-            echo -e " │  └─ \033[32m[MATCH] 校验通过！$FETCH_MSG 版本 $VER 完美支持 aes-128-gcm！\033[0m"
+            echo -e " │  └─ \033[32m[MATCH] 校验通过！$FETCH_MSG 版本 $VER 的方法表中含 $PREFERRED_METHOD！\033[0m"
             break
         fi
     done
 
     if [[ -z "$FOUND_VER" ]]; then
-        echo -e "\033[31m[ERROR] 未能在版本列表中找到任何支持 aes-128-gcm 的版本！\033[0m"
+        echo -e "\033[31m[ERROR] 未能在版本列表中找到任何方法表内含 $PREFERRED_METHOD 的版本！\033[0m"
         cleanup_on_exit
         TMP_DIR=""
         return
@@ -410,7 +486,7 @@ install_ss() {
     echo -e "\n  选择加密方式 (当前版本共支持 ${#METHODS[@]} 种):"
     local idx=1
     for m in "${METHODS[@]}"; do
-        if [[ "$m" == "aes-128-gcm" ]]; then
+        if [[ "$m" == "$PREFERRED_METHOD" ]]; then
             echo "    ${idx}) ${m} (推荐，老旧客户端完美兼容)"
         else
             echo "    ${idx}) ${m}"
@@ -424,7 +500,7 @@ install_ss() {
     if [[ "$METHOD_CHOICE" =~ ^[0-9]+$ ]] && (( METHOD_CHOICE >= 1 && METHOD_CHOICE <= ${#METHODS[@]} )); then
         METHOD="${METHODS[$((METHOD_CHOICE-1))]}"
     else
-        METHOD="aes-128-gcm"
+        METHOD="$PREFERRED_METHOD"
     fi
 
     # AEAD-2022 的 password 必须是 base64、且解码长度等于 key 长度，否则 ssserver 启动即失败
@@ -452,10 +528,19 @@ install_ss() {
 
     echo "[STEP] 生成配置文件..."
     mkdir -p "$CONF_DIR"
+
+    # 监听地址自适应：内核具备 IPv6 栈时用 "::"（默认双栈，同时接受 IPv4），
+    # 否则退化为 "0.0.0.0"，避免在禁用 IPv6 的机器上 bind 失败导致服务起不来
+    local listen_addr="::"
+    if [[ ! -e /proc/net/if_inet6 ]]; then
+        listen_addr="0.0.0.0"
+        echo -e "  \033[33m[INFO] 未检测到系统 IPv6 栈，监听地址自动改用 0.0.0.0\033[0m"
+    fi
+
     # 用 jq 生成 JSON，避免密码含引号/反斜杠时写出非法配置；无 jq 时退回手工转义
     if command -v jq >/dev/null 2>&1; then
-        if ! jq -n --argjson port "$PORT" --arg pw "$PASSWORD" --arg method "$METHOD" --arg mode "$MODE" \
-            '{server: "::", server_port: $port, password: $pw, method: $method, mode: $mode, fast_open: false}' \
+        if ! jq -n --argjson port "$PORT" --arg server "$listen_addr" --arg pw "$PASSWORD" --arg method "$METHOD" --arg mode "$MODE" \
+            '{server: $server, server_port: $port, password: $pw, method: $method, mode: $mode, fast_open: false}' \
             > "${CONF_FILE}.tmp"; then
             echo -e "\033[31m[ERROR] 配置生成失败，安装已中止（现有安装未被改动）。\033[0m"
             rm -f "${CONF_FILE}.tmp"
@@ -464,7 +549,7 @@ install_ss() {
     else
         cat <<EOF > "${CONF_FILE}.tmp"
 {
-    "server": "::",
+    "server": "$listen_addr",
     "server_port": $PORT,
     "password": "$(json_escape "$PASSWORD")",
     "method": "$(json_escape "$METHOD")",
@@ -493,7 +578,7 @@ EOF
     open_port "$PORT"
 
     echo "[STEP] 配置系统自启服务..."
-    if command -v systemctl >/dev/null 2>&1; then
+    if has_systemd; then
         cat <<EOF > "$SYSTEMD_FILE"
 [Unit]
 Description=Shadowsocks-Rust Server
@@ -558,7 +643,10 @@ update_ss() {
         x86_64|amd64)   SS_ARCH="x86_64-unknown-linux-musl" ;;
         aarch64|arm64)  SS_ARCH="aarch64-unknown-linux-musl" ;;
         armv7l|armhf)   SS_ARCH="armv7-unknown-linux-musleabihf" ;;
+        armv6l)         SS_ARCH="arm-unknown-linux-musleabihf" ;;
         i386|i686)      SS_ARCH="i686-unknown-linux-musl" ;;
+        loongarch64)    SS_ARCH="loongarch64-unknown-linux-musl" ;;
+        riscv64)        SS_ARCH="riscv64gc-unknown-linux-musl" ;;
         *) echo -e "\033[31m[ERROR] 暂不支持的架构: $ARCH\033[0m"; return ;;
     esac
 
@@ -586,31 +674,39 @@ update_ss() {
     TMP_DIR=$(mktemp -d -p /var/tmp 2>/dev/null || mktemp -d)
     FOUND_VER=""
 
-    echo "[STEP] 正在逐个校验并检索支持 aes-128-gcm 的最新版本..."
+    echo "[STEP] 从最新版本开始逐个校验，检索方法表中含 $PREFERRED_METHOD 的最新版本..."
     for VER in $ALL_RELEASES; do
         echo " ├─ 正在核验版本: $VER ..."
         if download_and_verify "$VER" "$SS_ARCH" "$TMP_DIR"; then
             FOUND_VER="$VER"
-            echo -e " │  └─ \033[32m[MATCH] 校验通过！$FETCH_MSG 版本 $VER 完美支持 aes-128-gcm！\033[0m"
+            echo -e " │  └─ \033[32m[MATCH] 校验通过！$FETCH_MSG 版本 $VER 的方法表中含 $PREFERRED_METHOD！\033[0m"
             break
         fi
     done
 
     if [[ -z "$FOUND_VER" ]]; then
-        echo -e "\033[31m[ERROR] 未能在版本列表中找到任何支持 aes-128-gcm 的版本！\033[0m"
+        echo -e "\033[31m[ERROR] 未能在版本列表中找到任何方法表内含 $PREFERRED_METHOD 的版本！\033[0m"
+        cleanup_on_exit
+        TMP_DIR=""
+        return
+    fi
+
+    if [[ "${FOUND_VER#v}" == "${CURRENT_VER#v}" ]]; then
+        echo -e "\033[32m[INFO] 当前已安装版本 ($CURRENT_VER) 即为方法表中含 $PREFERRED_METHOD 的最新版本，无需更新！\033[0m"
         cleanup_on_exit
         TMP_DIR=""
         return
     fi
 
     if ! is_newer_version "$FOUND_VER" "$CURRENT_VER"; then
-        echo -e "\033[32m[INFO] 当前已安装版本 ($CURRENT_VER) 已经是支持 aes-128-gcm 的最高版本，无需更新！\033[0m"
+        echo -e "\033[33m[WARN] 检索到的最高支持版本 ($FOUND_VER) 低于当前已安装版本 ($CURRENT_VER)，不执行降级。\033[0m"
+        echo -e "\033[33m       如需回退到旧版本，请先卸载后重新安装。\033[0m"
         cleanup_on_exit
         TMP_DIR=""
         return
     fi
 
-    echo -e "\033[32m[INFO] 发现支持 aes-128-gcm 的较新版本: $FOUND_VER (升级自 $CURRENT_VER)，正在应用更新...\033[0m"
+    echo -e "\033[32m[INFO] 发现方法表中含 $PREFERRED_METHOD 的较新版本: $FOUND_VER (升级自 $CURRENT_VER)，正在应用更新...\033[0m"
     stop_service_cmd
     mv "${TMP_DIR}/ssserver" "$BIN_PATH"
     chmod +x "$BIN_PATH"
@@ -626,8 +722,18 @@ update_ss() {
 uninstall_ss() {
     read -p "确定要彻底卸载 Shadowsocks-Rust 吗？[y/N]: " CONFIRM
     if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        # 端口要在删除配置目录之前读出，否则之后无从得知该回收哪条防火墙规则
+        local remove_port=""
+        if [[ -f "$CONF_FILE" ]]; then
+            if command -v jq >/dev/null 2>&1; then
+                remove_port=$(jq -r '.server_port // empty' "$CONF_FILE" 2>/dev/null)
+            else
+                remove_port=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' "$CONF_FILE" 2>/dev/null | grep -oE '[0-9]+$')
+            fi
+        fi
+
         stop_service_cmd
-        if command -v systemctl >/dev/null 2>&1; then
+        if has_systemd; then
             systemctl disable shadowsocks-rust >/dev/null 2>&1
             rm -f "$SYSTEMD_FILE"
             systemctl daemon-reload
@@ -637,6 +743,11 @@ uninstall_ss() {
         fi
         rm -f "$BIN_PATH"
         rm -rf "$CONF_DIR"
+
+        if [[ "$remove_port" =~ ^[0-9]+$ ]]; then
+            close_port "$remove_port"
+        fi
+
         echo -e "\033[32m[SUCCESS] Shadowsocks-Rust 卸载完成。\033[0m"
     fi
 }
@@ -726,7 +837,7 @@ show_config() {
 # 8. 查看运行日志
 view_logs() {
     echo -e "\033[36m正在查看运行日志 (按 Ctrl+C 退出)... \033[0m\n"
-    if command -v journalctl >/dev/null 2>&1; then
+    if has_systemd && command -v journalctl >/dev/null 2>&1; then
         journalctl -u shadowsocks-rust -n 50 -f
     elif [[ -f "/var/log/messages" ]]; then
         tail -f -n 50 /var/log/messages
